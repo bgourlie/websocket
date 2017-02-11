@@ -74,8 +74,7 @@ like this:
       listen "ws://echo.websocket.org" Echo
 
 **Note:** If the connection goes down, the effect manager tries to reconnect
-with an exponential backoff strategy. Any messages you try to `send` while the
-connection is down are queued and will be sent as soon as possible.
+with an exponential backoff strategy.
 -}
 listen : String -> (String -> msg) -> Sub msg
 listen url tagger =
@@ -90,8 +89,7 @@ you might say something like this:
       keepAlive "ws://echo.websocket.org"
 
 **Note:** If the connection goes down, the effect manager tries to reconnect
-with an exponential backoff strategy. Any messages you try to `send` while the
-connection is down are queued and will be sent as soon as possible.
+with an exponential backoff strategy.
 -}
 keepAlive : String -> Sub msg
 keepAlive url =
