@@ -27,7 +27,6 @@ many unique connections to the same endpoint, you need a different library.
 import Dict
 import Process
 import Task exposing (Task)
-import Time exposing (Time)
 import WebSocket.LowLevel as WS
 
 
