@@ -210,18 +210,18 @@ type Msg
 onSelfMsg : Platform.Router msg Msg -> Msg -> State msg -> Task Never (State msg)
 onSelfMsg router selfMsg state =
   case selfMsg of
-    Receive category str ->
+    Receive uri str ->
       let
         sends =
-          Dict.get category state.subs
+          Dict.get "listen" state.subs
             |> Maybe.withDefault Dict.empty
             |> Dict.toList
-            |> List.map (\(uri, tagger) -> Platform.sendToApp router (tagger str))
+            |> List.map (\(_, tagger) -> Platform.sendToApp router (tagger str))
       in
         Task.sequence sends &> Task.succeed state
 
     Die uri ->
-      case Dict.get uri state.sockets of
+      case Dict.get (Debug.log "Die uri" uri) state.sockets of
         Nothing ->
           Task.succeed state
 
