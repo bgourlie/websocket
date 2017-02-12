@@ -1,7 +1,6 @@
 effect module WebSocket where { command = MyCmd, subscription = MySub } exposing
   ( send
   , listen
-  , keepAlive
   )
 
 {-| Web sockets make it cheaper to talk to your servers.
@@ -20,7 +19,7 @@ The API here attempts to cover the typical usage scenarios, but if you need
 many unique connections to the same endpoint, you need a different library.
 
 # Web Sockets
-@docs listen, keepAlive, send
+@docs listen, send
 
 -}
 
@@ -28,7 +27,7 @@ import Dict
 import Process
 import Task exposing (Task)
 import WebSocket.LowLevel as WS
-
+import Debug
 
 
 -- COMMANDS
@@ -47,13 +46,13 @@ type MyCmd msg
 send one message and then closed. Not good!
 -}
 send : String -> String -> Cmd msg
-send url message =
-  command (Send url message)
+send uri message =
+  command (Send uri message)
 
 
 cmdMap : (a -> b) -> MyCmd a -> MyCmd b
-cmdMap _ (Send url msg) =
-  Send url msg
+cmdMap _ (Send uri msg) =
+  Send uri msg
 
 
 
@@ -61,8 +60,7 @@ cmdMap _ (Send url msg) =
 
 
 type MySub msg
-  = Listen String (String -> msg)
-  | KeepAlive String
+  = Listen String String (String -> msg)
 
 
 {-| Subscribe to any incoming messages on a websocket. You might say something
@@ -77,34 +75,15 @@ like this:
 with an exponential backoff strategy.
 -}
 listen : String -> (String -> msg) -> Sub msg
-listen url tagger =
-  subscription (Listen url tagger)
-
-
-{-| Keep a connection alive, but do not report any messages. This is useful
-for keeping a connection open for when you only need to `send` messages. So
-you might say something like this:
-
-    subscriptions model =
-      keepAlive "ws://echo.websocket.org"
-
-**Note:** If the connection goes down, the effect manager tries to reconnect
-with an exponential backoff strategy.
--}
-keepAlive : String -> Sub msg
-keepAlive url =
-  subscription (KeepAlive url)
+listen uri tagger =
+  subscription (Listen "listen" uri tagger)
 
 
 subMap : (a -> b) -> MySub a -> MySub b
 subMap func sub =
   case sub of
-    Listen url tagger ->
-      Listen url (tagger >> func)
-
-    KeepAlive url ->
-      KeepAlive url
-
+    Listen category uri tagger ->
+      Listen category uri (tagger >> func)
 
 
 -- MANAGER
@@ -121,7 +100,7 @@ type alias SocketsDict =
 
 
 type alias SubsDict msg =
-  Dict.Dict String (List (String -> msg))
+  Dict.Dict String (Dict.Dict String (String -> msg))
 
 
 type Connection
@@ -148,30 +127,36 @@ onEffects
   -> List (MySub msg)
   -> State msg
   -> Task Never (State msg)
-onEffects router cmds subs state =
+onEffects router cmds newSubs oldState =
   let
-    newSubs =
-      buildSubDict subs Dict.empty
+    newSubs2 =
+      Debug.log "New subs" (buildSubDict newSubs Dict.empty)
 
     newEntries =
-      Dict.map (\k v -> []) newSubs
+      Debug.log "New entries" (buildEntriesDict newSubs Dict.empty)
 
-    leftStep name _ getNewSockets =
+    leftStep category _ getNewSockets =
       getNewSockets
-        |> Task.andThen (\newSockets -> attemptOpen router 0 name
-        |> Task.andThen (\pid -> Task.succeed (Dict.insert name (Opening 0 pid) newSockets)))
+        |> Task.andThen (\newSockets -> attemptOpen router 0 category
+        |> Task.andThen (\pid -> Task.succeed (Dict.insert category (Opening 0 pid) newSockets)))
 
-    bothStep name _ connection getNewSockets =
-      Task.map (Dict.insert name connection) getNewSockets
+    bothStep category _ connection getNewSockets =
+      Task.map (Dict.insert category connection) getNewSockets
 
-    rightStep name connection getNewSockets =
+    rightStep category connection getNewSockets =
       closeConnection connection &> getNewSockets
 
     collectNewSockets =
-      Dict.merge leftStep bothStep rightStep newEntries state.sockets (Task.succeed Dict.empty)
+      Dict.merge
+        leftStep
+        bothStep
+        rightStep
+        newEntries
+        oldState.sockets
+        (Task.succeed Dict.empty)
   in
     collectNewSockets
-      |> Task.andThen (\newSockets -> Task.succeed (State newSockets newSubs))
+      |> Task.andThen (\newSockets -> Task.succeed (Debug.log "New State" (State newSockets newSubs2)))
 
 
 
@@ -181,21 +166,34 @@ buildSubDict subs dict =
     [] ->
       dict
 
-    Listen name tagger :: rest ->
-      buildSubDict rest (Dict.update name (add tagger) dict)
-
-    KeepAlive name :: rest ->
-      buildSubDict rest (Dict.update name (Just << Maybe.withDefault []) dict)
+    Listen category uri tagger :: rest ->
+      buildSubDict rest (Dict.update category (set (uri, tagger)) dict)
 
 
-add : a -> Maybe (List a) -> Maybe (List a)
-add value maybeList =
-  case maybeList of
+buildEntriesDict : List (MySub msg) -> Dict.Dict String (List a) -> Dict.Dict String (List a)
+buildEntriesDict subs dict =
+  case subs of
+    [] ->
+      dict
+
+    Listen category uri tagger :: rest ->
+      case category of
+        "listen" ->
+          buildEntriesDict rest (Dict.update uri (Just << Maybe.withDefault []) dict)
+
+        _ ->
+          buildEntriesDict rest dict
+
+
+
+set : (comparable, b) -> Maybe (Dict.Dict comparable b) -> Maybe (Dict.Dict comparable b)
+set value maybeDict =
+  case maybeDict of
     Nothing ->
-      Just [value]
+      Just (Dict.fromList [value])
 
     Just list ->
-      Just (value :: list)
+      Just (Dict.fromList [value])
 
 
 
@@ -212,43 +210,44 @@ type Msg
 onSelfMsg : Platform.Router msg Msg -> Msg -> State msg -> Task Never (State msg)
 onSelfMsg router selfMsg state =
   case selfMsg of
-    Receive name str ->
+    Receive category str ->
       let
         sends =
-          Dict.get name state.subs
-            |> Maybe.withDefault []
-            |> List.map (\tagger -> Platform.sendToApp router (tagger str))
+          Dict.get category state.subs
+            |> Maybe.withDefault Dict.empty
+            |> Dict.toList
+            |> List.map (\(uri, tagger) -> Platform.sendToApp router (tagger str))
       in
         Task.sequence sends &> Task.succeed state
 
-    Die name ->
-      case Dict.get name state.sockets of
+    Die uri ->
+      case Dict.get uri state.sockets of
         Nothing ->
           Task.succeed state
 
         Just _ ->
-          attemptOpen router 0 name
-            |> Task.andThen (\pid -> Task.succeed (updateSocket name (Opening 0 pid) state))
+          attemptOpen router 0 uri
+            |> Task.andThen (\pid -> Task.succeed (updateSocket uri (Opening 0 pid) state))
 
-    GoodOpen name socket ->
+    GoodOpen uri socket ->
         Task.succeed state
 
-    BadOpen name ->
-      case Dict.get name state.sockets of
+    BadOpen uri ->
+      case Dict.get uri state.sockets of
         Nothing ->
           Task.succeed state
 
         Just (Opening n _) ->
-          attemptOpen router (n + 1) name
-            |> Task.andThen (\pid -> Task.succeed (updateSocket name (Opening (n + 1) pid) state))
+          attemptOpen router (n + 1) uri
+            |> Task.andThen (\pid -> Task.succeed (updateSocket uri (Opening (n + 1) pid) state))
 
         Just (Connected _) ->
           Task.succeed state
 
 
 updateSocket : String -> Connection -> State msg -> State msg
-updateSocket name connection state =
-  { state | sockets = Dict.insert name connection state.sockets }
+updateSocket uri connection state =
+  { state | sockets = Dict.insert uri connection state.sockets }
 
 
 
@@ -256,16 +255,16 @@ updateSocket name connection state =
 
 
 attemptOpen : Platform.Router msg Msg -> Int -> String -> Task x Process.Id
-attemptOpen router backoff name =
+attemptOpen router backoff uri =
   let
     goodOpen ws =
-      Platform.sendToSelf router (GoodOpen name ws)
+      Platform.sendToSelf router (GoodOpen uri ws)
 
     badOpen _ =
-      Platform.sendToSelf router (BadOpen name)
+      Platform.sendToSelf router (BadOpen uri)
 
     actuallyAttemptOpen =
-      open name router
+      open (Debug.log "Attempting to open ws connection" uri) router
         |> Task.andThen goodOpen
         |> Task.onError badOpen
   in
@@ -273,10 +272,10 @@ attemptOpen router backoff name =
 
 
 open : String -> Platform.Router msg Msg -> Task WS.BadOpen WS.WebSocket
-open name router =
-  WS.open name
-    { onMessage = \_ msg -> Platform.sendToSelf router (Receive name msg)
-    , onClose = \details -> Platform.sendToSelf router (Die name)
+open uri router =
+  WS.open uri
+    { onMessage = \_ msg -> Platform.sendToSelf router (Receive uri msg)
+    , onClose = \details -> Platform.sendToSelf router (Die uri)
     }
 
 
