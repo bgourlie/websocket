@@ -1,6 +1,8 @@
 effect module WebSocket where { command = MyCmd, subscription = MySub } exposing
   ( send
   , listen
+  , connectionOpened
+  , connectionClosed
   )
 
 {-| Web sockets make it cheaper to talk to your servers.
@@ -19,7 +21,7 @@ The API here attempts to cover the typical usage scenarios, but if you need
 many unique connections to the same endpoint, you need a different library.
 
 # Web Sockets
-@docs listen, send
+@docs listen, send, connectionOpened, connectionClosed
 
 -}
 
@@ -77,6 +79,30 @@ with an exponential backoff strategy.
 listen : String -> (String -> msg) -> Sub msg
 listen uri tagger =
   subscription (Listen "listen" uri tagger)
+
+
+{-| Subscribe to connection opened events:
+
+    type Msg = ConnectionOpened String | ...
+
+    subscriptions model =
+      connectionOpened ConnectionOpened
+-}
+connectionOpened : (String -> msg) -> Sub msg
+connectionOpened tagger =
+  subscription (Listen "connectionOpened" "" tagger)
+
+
+{-| Subscribe to connection closed events:
+
+    type Msg = ConnectionClosed String | ...
+
+    subscriptions model =
+      connectionClosed ConnectionClosed
+-}
+connectionClosed : (String -> msg) -> Sub msg
+connectionClosed tagger =
+  subscription (Listen "connectionClosed" "" tagger)
 
 
 subMap : (a -> b) -> MySub a -> MySub b
@@ -226,11 +252,26 @@ onSelfMsg router selfMsg state =
           Task.succeed state
 
         Just _ ->
-          attemptOpen router 0 uri
-            |> Task.andThen (\pid -> Task.succeed (updateSocket uri (Opening 0 pid) state))
+          let
+            sends =
+              Dict.get "connectionClosed" state.subs
+                |> Maybe.withDefault Dict.empty
+                |> Dict.toList
+                |> List.map (\(_, tagger) -> Platform.sendToApp router (tagger uri))
+          in
+            Task.sequence sends
+              |> Task.andThen (\_ -> attemptOpen router 0 uri)
+              |> Task.andThen (\pid -> Task.succeed (updateSocket uri (Opening 0 pid) state))
 
     GoodOpen uri socket ->
-        Task.succeed state
+      let
+        sends =
+          Dict.get "connectionOpened" state.subs
+            |> Maybe.withDefault Dict.empty
+            |> Dict.toList
+            |> List.map (\(_, tagger) -> Platform.sendToApp router (tagger uri))
+      in
+        Task.sequence sends &> Task.succeed state
 
     BadOpen uri ->
       case Dict.get uri state.sockets of
